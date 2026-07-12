@@ -9,8 +9,8 @@ from PIL import Image, ImageDraw, ImageFont
 # CONFIG
 # --------------------------------------------------------------------------
 CONFIG = {
-    "input_path":  "../input/vid2.mp4",
-    "output_path": "../output/vid2_matrix.mp4",
+    "input_path":  "../input/vid1.mp4",
+    "output_path": "../output/vid1_matrix.mp4",
 
     "font_matrix_path":  "../fonts/matrix_glyphs.ttf",
     "font_sparkle_path": "../fonts/sparkle_glyphs.ttf",
@@ -21,6 +21,7 @@ CONFIG = {
     "cell_size": 9,           # px per glyph cell (bigger = fewer, larger glyphs)
     "font_size": 7,           # kept smaller than cell_size so stamps can jitter a bit within a cell
 
+    # --- edge detection ---
     "canny_low": 40,
     "canny_high": 120,
     
@@ -42,17 +43,35 @@ CONFIG = {
     "interpolate_factor": 1,   # 1 = no interpolation, 2 = double the frame rate, etc.
     "output_fps": None,        # None = keep source fps * interpolate_factor
 
+    #   "timer"  - old behavior: raw video on a fixed clock, regardless of content
+    #   "motion" - NEW: analyze the video first, apply the glyph effect only
+    #              where motion is high
     "context_mode": "motion",
 
     "context_cycle_sec": 2.5,     # (timer mode only) length of one (effect + raw) cycle, in seconds
     "context_raw_sec": 1.2,       # (timer mode only) how much of each cycle is raw video
     "context_crossfade_sec": 0.15,# soft cross-fade in/out of raw bursts, avoids a jarring hard cut
 
+    # (motion mode only) motion score = mean frame-to-frame pixel difference
     "motion_resize_width": 160,       # smaller = faster scoring, still plenty accurate
     "motion_smooth_frames": 3,        # moving-average window (in source frames)
-    "motion_low_percentile": 40,      # frames scoring at/below this percentile -> fully raw
-    "motion_high_percentile": 70,     # frames scoring at/above this percentile -> fully effect
+    "motion_low_percentile": 22,      # frames scoring at/below this percentile -> fully raw
+    "motion_high_percentile": 80,     # frames scoring at/above this percentile -> fully effect
                                        # (between the two: smooth cross-fade)
+
+    # --- forced raw bursts: ALWAYS show a bit of raw original video at
+    # randomized intervals, no matter what context_mode/motion says. This is
+    # additive on top of context_mode - the two are combined (whichever wants
+    # "more raw" at a given moment wins), so context_mode can still pick
+    # sensible spots the rest of the time, but you're never guaranteed to go
+    # too long without seeing the real footage.
+    "force_raw_bursts": True,
+    "force_raw_min_gap_sec": 1.0,     # minimum time between the START of one forced burst and the next
+    "force_raw_max_gap_sec": 2.2,     # maximum time between them (actual gap is randomized in this range)
+    "force_raw_min_dur_sec": 1.0,     # each forced burst lasts 1-2s per your ask
+    "force_raw_max_dur_sec": 2.0,
+    "force_raw_crossfade_sec": 0.15,  # soft fade in/out for forced bursts too
+    "force_raw_seed": None,           # set an int for a reproducible burst schedule, None = random each run
 }
 
 
@@ -110,7 +129,7 @@ def compute_cell_density(edges, cell_size):
     h, w = edges.shape
     kernel = np.ones((cell_size, cell_size), np.float32) / (cell_size * cell_size)
     density_full = cv2.filter2D((edges > 0).astype(np.float32), -1, kernel)
-    
+    # sample at cell centers to get one value per cell
     return density_full[cell_size // 2::cell_size, cell_size // 2::cell_size]
 
 
@@ -128,22 +147,19 @@ def stamp_glyphs_by_density(canvas_bgr, density_grid, renderer, cfg):
         for c in range(cols):
             d = density_grid[r, c]
             if d <= cfg["empty_thresh"]:
-                continue  # stays black
+                continue
 
             y, x = r * cs, c * cs
             if d <= cfg["fill_thresh"]:
-                
                 if random.random() > cfg["sparse_glyph_prob"]:
                     continue
                 stamps = 1
             else:
-                # dense band: solid texture fill
                 stamps = cfg["fill_stamps_per_cell"]
 
             for _ in range(stamps):
                 glyph = renderer.random_glyph()
                 gh, gw = glyph.shape[:2]
-                
                 jx = x + random.randint(0, max(cs - gw, 0))
                 jy = y + random.randint(0, max(cs - gh, 0))
                 roi = canvas_bgr[jy:jy + gh, jx:jx + gw]
@@ -228,6 +244,42 @@ def raw_weight_motion(score, low_thresh, high_thresh):
     return float(np.clip(w, 0.0, 1.0))
 
 
+def generate_forced_bursts(duration_sec, cfg):
+    """
+    Build a schedule of randomized (start, end) raw-video burst windows
+    covering the whole video duration. Gaps between burst starts and each
+    burst's duration are both randomized within the configured ranges.
+    """
+    rng = random.Random(cfg["force_raw_seed"])  # None -> seeded from system entropy
+    bursts = []
+    t = rng.uniform(0, cfg["force_raw_min_gap_sec"])  # first burst can start near the beginning
+    while t < duration_sec:
+        dur = rng.uniform(cfg["force_raw_min_dur_sec"], cfg["force_raw_max_dur_sec"])
+        end = min(t + dur, duration_sec)
+        bursts.append((t, end))
+        gap = rng.uniform(cfg["force_raw_min_gap_sec"], cfg["force_raw_max_gap_sec"])
+        t = end + gap
+    return bursts
+
+
+def forced_raw_weight(t, bursts, fade):
+    """
+    Returns 0..1 raw-weight from the forced-burst schedule: 1.0 inside a
+    burst window, cross-fading over `fade` seconds at each edge, 0 outside.
+    """
+    fade = max(fade, 1e-6)
+    for start, end in bursts:
+        if start <= t <= end:
+            if t - start < fade:
+                return (t - start) / fade
+            if end - t < fade:
+                return (end - t) / fade
+            return 1.0
+        if t < start:
+            break  # bursts are sorted by start time, no need to check further
+    return 0.0
+
+
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
@@ -264,6 +316,13 @@ def run(config=CONFIG):
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(output_path, fourcc, out_fps, (w, h))
 
+    forced_bursts = []
+    if config["force_raw_bursts"]:
+        duration_sec = n_frames / src_fps
+        forced_bursts = generate_forced_bursts(duration_sec, config)
+        print(f"[matrix_fx] forced raw bursts (sec): "
+              f"{[(round(a, 2), round(b, 2)) for a, b in forced_bursts]}")
+
     font_matrix = load_font(os.path.join(here, config["font_matrix_path"]), config["font_size"])
     font_sparkle = load_font(os.path.join(here, config["font_sparkle_path"]), config["font_size"])
     renderer_matrix = GlyphRenderer(font_matrix, config["charset_matrix"], config["color_matrix"], config["cell_size"])
@@ -292,12 +351,14 @@ def run(config=CONFIG):
             t = output_frame_idx / out_fps
 
             if config["context_mode"] == "motion":
-                
                 score = motion_scores[min(frame_idx, len(motion_scores) - 1)]
                 w_raw = raw_weight_motion(score, motion_low_thresh, motion_high_thresh)
             else:
                 w_raw = raw_weight_timer(t, config)
-            
+                
+            if forced_bursts:
+                w_raw = max(w_raw, forced_raw_weight(t, forced_bursts, config["force_raw_crossfade_sec"]))
+
             if w_raw >= 1.0:
                 writer.write(f)
                 output_frame_idx += 1
@@ -332,6 +393,9 @@ def run(config=CONFIG):
 
         prev_frame = frame
         frame_idx += 1
+        
+        if frame_idx % 20 == 0:
+            print(f"[matrix_fx] processed {frame_idx}/{n_frames} source frames")
 
     cap.release()
     writer.release()
