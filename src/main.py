@@ -1,3 +1,4 @@
+
 import os
 import random
 import numpy as np
@@ -8,8 +9,8 @@ from PIL import Image, ImageDraw, ImageFont
 # CONFIG
 # --------------------------------------------------------------------------
 CONFIG = {
-    "input_path":  "../input/vid1.mp4",
-    "output_path": "../output/Video-995_matrix.mp4",
+    "input_path":  "../input/vid2.mp4",
+    "output_path": "../output/vid2_matrix.mp4",
 
     "font_matrix_path":  "../fonts/matrix_glyphs.ttf",
     "font_sparkle_path": "../fonts/sparkle_glyphs.ttf",
@@ -20,10 +21,9 @@ CONFIG = {
     "cell_size": 9,           # px per glyph cell (bigger = fewer, larger glyphs)
     "font_size": 7,           # kept smaller than cell_size so stamps can jitter a bit within a cell
 
-    # --- edge detection ---
     "canny_low": 40,
     "canny_high": 120,
-
+    
     "empty_thresh": 0.04,      # below this: pure black. Raise to suppress more background noise.
     "fill_thresh": 0.22,       # above this: solid texture fill (e.g. the tablecloth)
     "sparse_glyph_prob": 0.55, # chance of drawing in the sparse/outline band
@@ -42,9 +42,17 @@ CONFIG = {
     "interpolate_factor": 1,   # 1 = no interpolation, 2 = double the frame rate, etc.
     "output_fps": None,        # None = keep source fps * interpolate_factor
 
-    "context_cycle_sec": 2.5,     # length of one (effect + raw) cycle, in seconds
-    "context_raw_sec": 1.2,       # how much of each cycle is raw original video (1-2s per your ask)
-    "context_crossfade_sec": 0.15, # soft cross-fade in/out of the raw burst, avoids a jarring hard cut
+    "context_mode": "motion",
+
+    "context_cycle_sec": 2.5,     # (timer mode only) length of one (effect + raw) cycle, in seconds
+    "context_raw_sec": 1.2,       # (timer mode only) how much of each cycle is raw video
+    "context_crossfade_sec": 0.15,# soft cross-fade in/out of raw bursts, avoids a jarring hard cut
+
+    "motion_resize_width": 160,       # smaller = faster scoring, still plenty accurate
+    "motion_smooth_frames": 3,        # moving-average window (in source frames)
+    "motion_low_percentile": 40,      # frames scoring at/below this percentile -> fully raw
+    "motion_high_percentile": 70,     # frames scoring at/above this percentile -> fully effect
+                                       # (between the two: smooth cross-fade)
 }
 
 
@@ -124,7 +132,7 @@ def stamp_glyphs_by_density(canvas_bgr, density_grid, renderer, cfg):
 
             y, x = r * cs, c * cs
             if d <= cfg["fill_thresh"]:
-                # sparse band: outline/contour glyphs
+                
                 if random.random() > cfg["sparse_glyph_prob"]:
                     continue
                 stamps = 1
@@ -135,7 +143,7 @@ def stamp_glyphs_by_density(canvas_bgr, density_grid, renderer, cfg):
             for _ in range(stamps):
                 glyph = renderer.random_glyph()
                 gh, gw = glyph.shape[:2]
-                # small random jitter within the cell for the multi-stamp fill look
+                
                 jx = x + random.randint(0, max(cs - gw, 0))
                 jy = y + random.randint(0, max(cs - gh, 0))
                 roi = canvas_bgr[jy:jy + gh, jx:jx + gw]
@@ -148,12 +156,47 @@ def stamp_glyphs_by_density(canvas_bgr, density_grid, renderer, cfg):
                 ).astype(np.uint8)
 
 
-def raw_weight(t, cfg):
+def compute_motion_scores(input_path, resize_width, smooth_frames):
     """
-    Returns 0..1: how much of the RAW original frame should show at time t
-    (seconds into the output). 1 = fully raw, 0 = fully effect. Ramps up/down
-    over context_crossfade_sec at the edges of each raw burst window so the
-    cut isn't jarring.
+    First pass over the video: for every frame, compute a motion score =
+    mean absolute pixel difference from the previous frame, on a small
+    downsized grayscale copy (fast, and a static camera means only the
+    moving subject - e.g. flapping wings - contributes meaningfully).
+    Returns a smoothed numpy array of scores, one per source frame.
+    """
+    cap = cv2.VideoCapture(input_path)
+    if not cap.isOpened():
+        raise FileNotFoundError(f"Could not open input video: {input_path}")
+
+    scores = []
+    prev_gray = None
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        h, w = frame.shape[:2]
+        new_h = max(int(h * resize_width / w), 1)
+        small = cv2.resize(frame, (resize_width, new_h), interpolation=cv2.INTER_AREA)
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        if prev_gray is None:
+            scores.append(0.0)
+        else:
+            scores.append(float(cv2.absdiff(gray, prev_gray).mean()))
+        prev_gray = gray
+    cap.release()
+
+    scores = np.array(scores, dtype=np.float32)
+    if smooth_frames > 1 and len(scores) > 0:
+        kernel = np.ones(smooth_frames, dtype=np.float32) / smooth_frames
+        scores = np.convolve(scores, kernel, mode="same")
+    return scores
+
+
+def raw_weight_timer(t, cfg):
+    """
+    (timer mode) Returns 0..1: how much of the RAW original frame should
+    show at time t (seconds into the output). Ramps over context_crossfade_sec
+    at the edges of each raw burst window so the cut isn't jarring.
     """
     cycle = cfg["context_cycle_sec"]
     raw_dur = cfg["context_raw_sec"]
@@ -170,6 +213,19 @@ def raw_weight(t, cfg):
     if pos > raw_dur - fade:
         return max((raw_dur - pos) / fade, 0.0)
     return 1.0
+
+
+def raw_weight_motion(score, low_thresh, high_thresh):
+    """
+    (motion mode) Returns 0..1: how much of the RAW original frame should
+    show, based on this frame's motion score. score <= low_thresh -> fully
+    raw (1.0, e.g. bird perched/still). score >= high_thresh -> fully effect
+    (0.0, e.g. wings flapping). Linear cross-fade in between.
+    """
+    if high_thresh <= low_thresh:
+        return 0.0
+    w = (high_thresh - score) / (high_thresh - low_thresh)
+    return float(np.clip(w, 0.0, 1.0))
 
 
 # --------------------------------------------------------------------------
@@ -189,6 +245,20 @@ def run(config=CONFIG):
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    motion_scores = None
+    motion_low_thresh = motion_high_thresh = None
+    if config["context_mode"] == "motion":
+        motion_scores = compute_motion_scores(
+            input_path, config["motion_resize_width"], config["motion_smooth_frames"]
+        )
+        motion_low_thresh = float(np.percentile(motion_scores, config["motion_low_percentile"]))
+        motion_high_thresh = float(np.percentile(motion_scores, config["motion_high_percentile"]))
+        print(
+            f"[matrix_fx] motion scores: min={motion_scores.min():.2f} "
+            f"max={motion_scores.max():.2f} low_thresh={motion_low_thresh:.2f} "
+            f"high_thresh={motion_high_thresh:.2f}"
+        )
 
     out_fps = config["output_fps"] or (src_fps * config["interpolate_factor"])
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -220,8 +290,14 @@ def run(config=CONFIG):
 
         for f in frames_to_process:
             t = output_frame_idx / out_fps
-            w_raw = raw_weight(t, config)
 
+            if config["context_mode"] == "motion":
+                
+                score = motion_scores[min(frame_idx, len(motion_scores) - 1)]
+                w_raw = raw_weight_motion(score, motion_low_thresh, motion_high_thresh)
+            else:
+                w_raw = raw_weight_timer(t, config)
+            
             if w_raw >= 1.0:
                 writer.write(f)
                 output_frame_idx += 1
@@ -256,8 +332,6 @@ def run(config=CONFIG):
 
         prev_frame = frame
         frame_idx += 1
-        # if frame_idx % 20 == 0:
-        #     print(f"[matrix_fx] processed {frame_idx}/{n_frames} source frames")
 
     cap.release()
     writer.release()
